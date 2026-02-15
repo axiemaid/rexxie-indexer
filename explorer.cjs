@@ -11,6 +11,9 @@ const PORT = process.env.PORT || 3001;
 const LEDGER_PATH = path.join(__dirname, 'ledger.json');
 const WOC_BASE = 'https://api.whatsonchain.com/v1/bsv/main';
 const RELAYNFT_ORIGIN = 'cdea2c203af755cd9477ca310c61021abaafc135a21d8f93b8ebfc6ca5f95712';
+const REXXIE_CLASS_ORIGIN = '12d8ca4bc0eaf26660627cc1671de6a0047246f39f3aa06633f8204223d70cc5';
+const REXXIE_CLASS_REF = REXXIE_CLASS_ORIGIN + '_o2';
+const MINTING_ADDRESS = '12nG9uFESfdyE9SdYHVXQeCGFdfYLcdYZG';
 
 // Known Rexxie txids to seed the indexer
 const SEED_TXIDS = [
@@ -168,10 +171,10 @@ function resolveAddress(arg) {
   return null;
 }
 
-// Check if a tx references the RelayNFT class
-function refsRelayNFT(payload) {
+// Check if a tx references the Rexxie or RelayNFT class
+function refsRexxie(payload) {
   const refs = payload.ref || [];
-  return refs.some(r => typeof r === 'string' && r.includes(RELAYNFT_ORIGIN));
+  return refs.some(r => typeof r === 'string' && (r.includes(REXXIE_CLASS_ORIGIN) || r.includes(RELAYNFT_ORIGIN)));
 }
 
 // ── Indexer ─────────────────────────────────────────────────────────────────
@@ -199,7 +202,7 @@ async function processTx(txid) {
     }
 
     const exec = parseExec(payload);
-    const usesRelayNFT = refsRelayNFT(payload);
+    const usesRelayNFT = refsRexxie(payload);
     console.log(`  ${exec.type || '?'} | app=${exec.appName || '?'} | relayNFT=${usesRelayNFT}`);
 
     // Skip non-RelayNFT txs (deploy of OrderLock, etc.)
@@ -349,7 +352,96 @@ async function processTx(txid) {
   }
 }
 
-async function runIndexer() {
+// Discover Rexxie mints by scanning the minting address history.
+// Filter: must be a mint tx AND must spend a jig that traces to the Rexxie COL class.
+// We verify by checking if vin[1] (the class jig input) comes from a known Rexxie tx.
+async function discoverMints() {
+  console.log(`Discovering Rexxie mints from address ${MINTING_ADDRESS}...`);
+  console.log(`  Rexxie COL class: ${REXXIE_CLASS_ORIGIN}`);
+
+  try {
+    const history = await wocGet(`/address/${MINTING_ADDRESS}/history`);
+    if (!Array.isArray(history)) {
+      console.log('  Could not fetch address history');
+      return;
+    }
+    // Sort by block height ascending
+    history.sort((a, b) => (a.height || 0) - (b.height || 0));
+    console.log(`  Address has ${history.length} total txs`);
+
+    // Track the COL class jig location: starts at deploy tx vout 2
+    const knownClassLocations = new Set();
+    knownClassLocations.add(`${REXXIE_CLASS_ORIGIN}:2`);
+
+    let found = 0;
+    let scanned = 0;
+
+    for (const htx of history) {
+      const txid = htx.tx_hash;
+      scanned++;
+      if (ledger.processed[txid] || ledger.queue.includes(txid)) continue;
+      // Skip txs before the COL deploy block
+      if (htx.height && htx.height < 771246) continue;
+
+      try {
+        const tx = await getTx(txid);
+        const payload = decodeRunPayload(tx);
+        if (!payload) { await new Promise(r => setTimeout(r, 200)); continue; }
+
+        const exec = parseExec(payload);
+        if (exec.type !== 'mint') { await new Promise(r => setTimeout(r, 200)); continue; }
+
+        // Check if this mint spends the Rexxie COL class jig
+        // The class jig is typically vin[1] (vin[0] is funding)
+        let isRexxie = false;
+        for (const vin of (tx.vin || [])) {
+          const loc = `${vin.txid}:${vin.vout}`;
+          if (knownClassLocations.has(loc)) {
+            isRexxie = true;
+            break;
+          }
+        }
+
+        if (isRexxie) {
+          ledger.queue.push(txid);
+          found++;
+
+          // The class jig is recreated in this tx — find its new location
+          // It's the last P2PKH output to the minting address (class state output)
+          for (let i = tx.vout.length - 1; i >= 0; i--) {
+            const vout = tx.vout[i];
+            const addr = vout.scriptPubKey?.addresses?.[0];
+            if (addr === MINTING_ADDRESS && !vout.scriptPubKey.asm.includes('OP_RETURN')) {
+              knownClassLocations.add(`${txid}:${i}`);
+              break;
+            }
+          }
+
+          if (found % 50 === 0) {
+            console.log(`  Found ${found} Rexxie mints (scanned ${scanned}/${history.length})...`);
+            saveLedger();
+          }
+        }
+
+        // Rate limit
+        await new Promise(r => setTimeout(r, 300));
+      } catch (e) {
+        await new Promise(r => setTimeout(r, 500));
+      }
+    }
+
+    console.log(`  Discovery complete. Found ${found} Rexxie mints out of ${history.length} txs.`);
+    saveLedger();
+  } catch (e) {
+    console.error('  Discovery error:', e.message);
+  }
+}
+
+async function runIndexer(discover = false) {
+  if (discover) {
+    await discoverMints();
+  }
+
   for (const txid of SEED_TXIDS) {
     if (!ledger.processed[txid] && !ledger.queue.includes(txid)) {
       ledger.queue.push(txid);
@@ -359,12 +451,12 @@ async function runIndexer() {
   console.log(`Indexer starting. Queue: ${ledger.queue.length}, Processed: ${Object.keys(ledger.processed).length}`);
 
   let safety = 0;
-  while (ledger.queue.length > 0 && safety++ < 100) {
+  while (ledger.queue.length > 0 && safety++ < 5000) {
     const txid = ledger.queue.shift();
     await processTx(txid);
   }
 
-  if (safety >= 100) console.log('Indexer hit safety limit (100 txs per run)');
+  if (safety >= 5000) console.log('Indexer hit safety limit (5000 txs per run)');
   console.log(`Indexer done. ${Object.keys(ledger.nfts).length} NFTs indexed.`);
 }
 
@@ -391,6 +483,7 @@ app.get('/', (req, res) => {
       'GET /search?q=name': 'Search NFTs by name/description',
       'POST /index': 'Submit txids for indexing { txids: [...] }',
       'POST /reindex': 'Re-run indexer on queued txids',
+      'POST /discover': 'Scan minting address to discover all Rexxie mints (slow, ~6k txs)',
       'GET /health': 'Health check',
     },
   });
@@ -474,6 +567,12 @@ app.post('/index', async (req, res) => {
 app.post('/reindex', async (req, res) => {
   res.json({ status: 'reindexing', queueLength: ledger.queue.length });
   runIndexer().catch(console.error);
+});
+
+// Discover all Rexxie mints from on-chain data
+app.post('/discover', async (req, res) => {
+  res.json({ status: 'discovering', message: 'Scanning minting address for Rexxie mints...' });
+  runIndexer(true).catch(console.error);
 });
 
 app.get('/health', (req, res) => {
