@@ -2,16 +2,15 @@
 'use strict';
 
 // Ownership indexer for Rexxie NFTs
-// Uses pre-built spend maps (from build-spendmap.cjs) for fast UTXO tracing
-// For addresses not in cache, fetches tx-by-tx (slower but works)
+// Uses WoC's /tx/{txid}/{vout}/spent endpoint to follow the UTXO chain
 
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
 const WOC = 'https://api.whatsonchain.com/v1/bsv/main';
+const agent = new https.Agent({ keepAlive: false });
 const LEDGER_PATH = path.join(__dirname, 'ledger.json');
-const CACHE_DIR = path.join(__dirname, 'cache');
 const MINTING_ADDR = '12nG9uFESfdyE9SdYHVXQeCGFdfYLcdYZG';
 const NFT_VOUT = 3; // NFT jig at vout 3
 
@@ -25,72 +24,33 @@ function saveLedger() {
 
 function wocGet(ep) {
   return new Promise((resolve, reject) => {
-    https.get(WOC + ep, { headers: { Accept: 'application/json' } }, res => {
+    const req = https.get(WOC + ep, { headers: { Accept: 'application/json' }, timeout: 15000, agent }, res => {
       let d = '';
       res.on('data', c => d += c);
       res.on('end', () => {
         if (res.statusCode === 200) try { resolve(JSON.parse(d)); } catch { resolve(d); }
+        else if (res.statusCode === 404) resolve(null); // unspent
         else if (res.statusCode === 429) {
           setTimeout(() => wocGet(ep).then(resolve).catch(reject), 5000);
         }
-        else reject(new Error(`WoC ${res.statusCode}`));
+        else reject(new Error(`WoC ${res.statusCode}: ${d.slice(0, 100)}`));
       });
-    }).on('error', reject);
+    });
+    req.on('timeout', () => { req.destroy(); reject(new Error('WoC timeout: ' + ep)); });
+    req.on('error', reject);
   });
 }
 
-// Load spend maps from cache
-const spendMaps = {};
-function loadSpendMap(address) {
-  if (spendMaps[address]) return spendMaps[address];
-  const cacheFile = path.join(CACHE_DIR, `spendmap-${address}.json`);
-  if (fs.existsSync(cacheFile)) {
-    spendMaps[address] = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
-    return spendMaps[address];
-  }
-  return null;
-}
-
-// Find spending txid for a specific output using cached spend maps
-function findSpendInCache(txid, vout, address) {
-  const map = loadSpendMap(address);
-  if (!map) return null;
-  const key = `${txid}:${vout}`;
-  const spendingTxid = map[key];
-  if (!spendingTxid || typeof spendingTxid !== 'string') return null;
-  return spendingTxid;
-}
-
-// Get dust output address from cached spend map
-function getDustAddr(txid, vout, address) {
-  const map = loadSpendMap(address);
-  if (!map?._dustOutputs) return null;
-  return map._dustOutputs[`${txid}:${vout}`];
-}
-
-// Fallback: find spender by fetching tx directly
-async function findSpendOnChain(txid, vout, address) {
-  if (!address) {
-    try {
-      const tx = await wocGet(`/tx/hash/${txid}`);
-      address = tx.vout[vout]?.scriptPubKey?.addresses?.[0];
-      if (!address) return null;
-      await new Promise(r => setTimeout(r, 200));
-    } catch { return null; }
-  }
-
-  try {
-    const history = await wocGet(`/address/${address}/history`);
-    for (const h of history) {
-      if (h.tx_hash === txid) continue;
-      const tx = await wocGet(`/tx/hash/${h.tx_hash}`);
-      for (const vin of (tx.vin || [])) {
-        if (vin.txid === txid && vin.vout === vout) return h.tx_hash;
-      }
-      await new Promise(r => setTimeout(r, 200));
-    }
-  } catch {}
+// Check if a specific output is spent, returns spending txid or null
+async function getSpender(txid, vout) {
+  const result = await wocGet(`/tx/${txid}/${vout}/spent`);
+  if (result && result.txid) return result.txid;
   return null; // unspent
+}
+
+// Get tx details
+async function getTx(txid) {
+  return wocGet(`/tx/hash/${txid}`);
 }
 
 // Trace a single NFT from mint to current owner
@@ -104,67 +64,65 @@ async function traceNFT(num) {
   let transfers = [{ txid: currentTxid, type: 'mint', to: currentAddr }];
   let hops = 0;
 
-  while (hops < 50) {
-    // Try cache first, then on-chain
-    let spendingTxid = findSpendInCache(currentTxid, currentVout, currentAddr);
-
-    if (!spendingTxid) {
-      // Try on-chain lookup (slow)
-      spendingTxid = await findSpendOnChain(currentTxid, currentVout, currentAddr);
-    }
+  while (hops < 100) {
+    // Check if current output is spent
+    const spendingTxid = await getSpender(currentTxid, currentVout);
+    await new Promise(r => setTimeout(r, 300));
 
     if (!spendingTxid) break; // unspent = current holder
 
     hops++;
 
-    // Find NFT jig in spending tx: first dust output
-    // Try cache first
+    // Get the spending tx to find where the NFT jig moved
+    const spendTx = await getTx(spendingTxid);
+    await new Promise(r => setTimeout(r, 300));
+
+    if (!spendTx) break;
+
+    // Find the NFT jig in outputs
+    // OrderLock = marketplace listing (NFT in escrow). Check Run payload to decide.
+    // If send uses $arb, NFT is in OrderLock. Otherwise dust P2PKH.
     let newAddr = null;
     let newVout = null;
+    let isOrderLock = false;
 
-    // Check cached dust outputs for this tx
-    const map = loadSpendMap(currentAddr);
-    if (map?._dustOutputs) {
-      // Find dust outputs from this spending tx
-      for (const [key, addr] of Object.entries(map._dustOutputs)) {
-        if (key.startsWith(spendingTxid + ':')) {
+    // Check for nonstandard outputs first (OrderLock marketplace listing)
+    for (const vout of spendTx.vout) {
+      if (vout.scriptPubKey?.asm?.includes('OP_RETURN')) continue;
+      if (vout.scriptPubKey?.type === 'nonstandard' && vout.value <= 0.001) {
+        newVout = vout.n;
+        isOrderLock = true;
+        break;
+      }
+    }
+
+    // If no OrderLock, find dust P2PKH (normal send/transfer)
+    if (!isOrderLock) {
+      for (const vout of spendTx.vout) {
+        if (vout.scriptPubKey?.asm?.includes('OP_RETURN')) continue;
+        const addr = vout.scriptPubKey?.addresses?.[0];
+        if (addr && vout.value > 0 && vout.value <= 0.00001) {
           newAddr = addr;
-          newVout = parseInt(key.split(':')[1]);
-          break; // first dust output
+          newVout = vout.n;
+          break;
         }
       }
     }
 
-    // If not in cache, fetch the tx
-    if (!newAddr) {
-      try {
-        const tx = await wocGet(`/tx/hash/${spendingTxid}`);
-        for (const vout of tx.vout) {
-          if (vout.scriptPubKey?.asm?.includes('OP_RETURN')) continue;
-          const addr = vout.scriptPubKey?.addresses?.[0];
-          if (addr && vout.value <= 0.00001) {
-            newAddr = addr;
-            newVout = vout.n;
-            break;
-          }
-        }
-        await new Promise(r => setTimeout(r, 200));
-      } catch { break; }
-    }
+    if (newVout === null) break;
 
-    if (!newAddr) break;
-
-    if (newAddr !== currentAddr) {
+    if (!isOrderLock && newAddr && newAddr !== currentAddr) {
       transfers.push({
         txid: spendingTxid,
         type: 'send',
         from: currentAddr,
         to: newAddr,
-        blockHeight: null,
+        blockHeight: spendTx.blockheight,
       });
+      currentAddr = newAddr;
     }
+    // OrderLock: don't update currentAddr — the NFT is in escrow
 
-    currentAddr = newAddr;
     currentVout = newVout;
     currentTxid = spendingTxid;
   }
@@ -177,12 +135,6 @@ async function traceNFT(num) {
   const startNum = parseInt(process.argv[2]) || 1;
   const batchSize = parseInt(process.argv[3]) || 2222;
 
-  // Check minting address spend map exists
-  if (!loadSpendMap(MINTING_ADDR)) {
-    console.error('ERROR: No spend map for minting address. Run build-spendmap.cjs first.');
-    process.exit(1);
-  }
-
   const nums = Object.keys(ledger.nfts)
     .map(Number)
     .filter(n => n >= startNum && !ledger.nfts[n].owner)
@@ -194,6 +146,7 @@ async function traceNFT(num) {
   let indexed = 0;
   for (const num of nums) {
     try {
+      process.stdout.write(`Tracing #${num}... `);
       const result = await traceNFT(num);
       if (result) {
         const nft = ledger.nfts[num];
@@ -208,18 +161,38 @@ async function traceNFT(num) {
 
         const isTransferred = result.owner !== MINTING_ADDR;
         if (isTransferred) {
-          console.log(`#${num}: ${result.transfers.length - 1} sends → ${result.owner}`);
+          console.log(`${result.hops} hops → ${result.owner}`);
+        } else {
+          console.log(`still at minting addr (${result.hops} hops)`);
         }
 
-        if (indexed % 50 === 0) {
+        if (indexed % 10 === 0) {
           ledger.ownershipIndexed = Object.values(ledger.nfts).filter(n => n.owner).length;
           saveLedger();
           const uniqueOwners = new Set(Object.values(ledger.nfts).map(n => n.owner).filter(Boolean)).size;
-          console.log(`--- Saved. ${indexed} done, ${uniqueOwners} unique owners ---`);
+          console.log(`--- Saved. ${indexed}/${nums.length} done, ${uniqueOwners} unique owners ---`);
         }
       }
     } catch (e) {
       console.error(`#${num} error: ${e.message}`);
+      // Retry once on timeout
+      if (e.message.includes('timeout')) {
+        try {
+          console.log(`#${num}: retrying...`);
+          await new Promise(r => setTimeout(r, 2000));
+          const result = await traceNFT(num);
+          if (result) {
+            const nft = ledger.nfts[num];
+            nft.owner = result.owner;
+            nft.lastTx = result.transfers[result.transfers.length - 1]?.txid;
+            nft.transfers = result.transfers;
+            if (!ledger.owners[result.owner]) ledger.owners[result.owner] = [];
+            if (!ledger.owners[result.owner].includes(num)) ledger.owners[result.owner].push(num);
+            indexed++;
+            if (result.owner !== MINTING_ADDR) console.log(`#${num}: ${result.transfers.length - 1} sends → ${result.owner}`);
+          }
+        } catch (e2) { console.error(`#${num} retry failed: ${e2.message}`); }
+      }
     }
   }
 

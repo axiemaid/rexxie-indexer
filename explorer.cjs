@@ -240,6 +240,10 @@ app.use((req, res, next) => {
   next();
 });
 
+// Serve local images
+const IMG_DIR = path.join(__dirname, 'images');
+app.use('/images', express.static(IMG_DIR));
+
 // Root: agent-friendly API schema
 app.get('/', (req, res) => {
   res.json({
@@ -258,6 +262,7 @@ app.get('/', (req, res) => {
       'GET /random': 'Random NFT',
       'GET /stats': 'Collection statistics',
       'POST /index-owners?start=1&batch=50': 'Index ownership from chain (slow)',
+      'GET /images/:number.png': 'NFT image (locally hosted)',
       'GET /health': 'Health check',
     },
   });
@@ -303,7 +308,8 @@ app.get('/nft/:number', (req, res) => {
   const num = parseInt(req.params.number);
   const nft = ledger.nfts[num];
   if (!nft) return res.status(404).json({ error: 'NFT not found', valid: '1-2222' });
-  res.json({ ...nft });
+  const hasLocal = fs.existsSync(path.join(IMG_DIR, `${num}.png`));
+  res.json({ ...nft, localImage: hasLocal ? `/images/${num}.png` : null });
 });
 
 app.get('/nft/tx/:txid', (req, res) => {

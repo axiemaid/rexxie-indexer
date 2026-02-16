@@ -1,2 +1,7 @@
 node_modules/
 ledger.json
+.DS_Store
+*.log
+logs/
+images/
+cache/
